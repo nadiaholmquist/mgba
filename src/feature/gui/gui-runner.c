@@ -260,23 +260,24 @@ void mGUIDeinit(struct mGUIRunner* runner) {
 	}
 }
 
+#include <whb/log.h>
 static void _log(struct mLogger* logger, int category, enum mLogLevel level, const char* format, va_list args) {
 	struct mGUILogger* guiLogger = (struct mGUILogger*) logger;
-	if (!guiLogger->vf) {
+/*	if (!guiLogger->vf) {
 		return;
 	}
 	if (!(guiLogger->logLevel & level)) {
 		return;
-	}
+	}*/
 
 	char log[256] = {0};
 	vsnprintf(log, sizeof(log) - 1, format, args);
 	char log2[256] = {0};
-	size_t len = snprintf(log2, sizeof(log2) - 1, "%s: %s\n", mLogCategoryName(category), log);
+	size_t len = snprintf(log2, sizeof(log2) - 1, "%s: %s", mLogCategoryName(category), log);
 	if (len >= sizeof(log2)) {
 		len = sizeof(log2) - 1;
 	}
-	if (guiLogger->vf->write(guiLogger->vf, log2, len) < 0) {
+/*	if (guiLogger->vf->write(guiLogger->vf, log2, len) < 0) {
 		char path[PATH_MAX];
 		mCoreConfigDirectory(path, PATH_MAX);
 		strncat(path, PATH_SEP "log", PATH_MAX - strlen(path));
@@ -286,7 +287,9 @@ static void _log(struct mLogger* logger, int category, enum mLogLevel level, con
 			guiLogger->vf->close(guiLogger->vf);
 			guiLogger->vf = NULL;
 		}
-	}
+	}*/
+
+	WHBLogPrint(log2);
 }
 
 static void _updateLoading(size_t read, size_t size, void* context) {
@@ -538,7 +541,11 @@ void mGUIRun(struct mGUIRunner* runner, const char* path) {
 				++frame;
 			}
 		}
-
+#ifdef WIIU
+#include <whb/proc.h>
+		if (!WHBProcIsRunning())
+			break;
+#endif
 		if (runner->paused) {
 			runner->paused(runner);
 		}
@@ -657,13 +664,16 @@ void mGUIRunloop(struct mGUIRunner* runner) {
 		if (preselect) {
 			++preselect;
 		}
-		if (!GUISelectFile(&runner->params, path, sizeof(path), _testExtensions, NULL, preselect)) {
+		mGUIRun(runner, "/vol/external01/emerald.gba");
+
+	/*	if (!GUISelectFile(&runner->params, path, sizeof(path), _testExtensions, NULL, preselect)) {
+			mLOG(GUI_RUNNER, DEBUG, "didn't select a file");
 			break;
 		}
 		mCoreConfigSetValue(&runner->config, "lastDirectory", runner->params.currentPath);
 		mCoreConfigSetValue(&runner->config, "lastGame", path);
 		mCoreConfigSave(&runner->config);
-		mGUIRun(runner, path);
+		mGUIRun(runner, path);*/
 	}
 }
 

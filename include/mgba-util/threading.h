@@ -27,6 +27,8 @@ CXX_GUARD_START
 #include <mgba-util/platform/3ds/threading.h>
 #elif defined(__SWITCH__)
 #include <mgba-util/platform/switch/threading.h>
+#elif defined(__WIIU__)
+#include <mgba-util/platform/wiiu/threading.h>
 #else
 #define DISABLE_THREADING
 #endif
