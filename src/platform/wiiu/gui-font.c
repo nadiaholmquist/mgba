@@ -10,7 +10,9 @@
 #include <mgba-util/vfs.h>
 
 #include <gx2/texture.h>
+#include <whb/log.h>
 
+extern GX2Texture uiTexture;
 
 #define GLYPH_HEIGHT 24
 #define CELL_HEIGHT 32
@@ -27,8 +29,9 @@ struct GUIFont* GUIFontCreate(void) {
 		return NULL;
 	}
 
-	struct VFile* vf = VFileOpen("romfs://font.png", O_RDONLY);
+	struct VFile* vf = VFileOpen("romfs://font-new.png", O_RDONLY);
 	if (!vf) {
+		WHBLogPrint("open font failed");
 		return NULL;
 	}
 	png_structp png = PNGReadOpen(vf, 0);
@@ -55,6 +58,8 @@ struct GUIFont* GUIFontCreate(void) {
 	}
 	PNGReadClose(png, info, end);
 	vf->close(vf);
+
+	WHBLogPrintf("create font %p", &font);
 
 	return font;
 }
@@ -100,6 +105,7 @@ void GUIFontDrawGlyph(const struct GUIFont* font, int x, int y, uint32_t color, 
 		glyph = '?';
 	}
 	struct GUIFontGlyphMetric metric = defaultFontMetrics[glyph];
+
 }
 
 void GUIFontDrawIcon(const struct GUIFont* font, int x, int y, enum GUIAlignment align, enum GUIOrientation orient, uint32_t color, enum GUIIcon icon) {

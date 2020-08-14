@@ -19,17 +19,10 @@
 
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/filesystem.h>
+#include <coreinit/foreground.h>
 #include <coreinit/thread.h>
 #include <proc_ui/procui.h>
-#include <sysapp/launch.h>
-
-#include <gfd.h>
-#include <gx2/draw.h>
-#include <gx2/shaders.h>
-#include <gx2/mem.h>
-#include <gx2/registers.h>
-#include <gx2r/draw.h>
-#include <gx2r/buffer.h>
+#include <vpad/input.h>
 
 #include <whb/file.h>
 #include <whb/sdcard.h>
@@ -37,10 +30,16 @@
 #include <whb/log.h>
 #include <whb/log_udp.h>
 #include <whb/log_cafe.h>
-#include <whb/proc.h>
+#include <whb/crash.h>
+
+#include "wiiu-gpu.h"
 
 #include <romfs-wiiu.h>
 
+#include <gx2/mem.h>
+#include <gx2/surface.h>
+#include <gx2/swap.h>
+#include <gx2/display.h>
 #include <vpad/input.h>
 
 #define VPAD_INPUT 0x7f87ffff
@@ -50,9 +49,6 @@
 #define N_BUFFERS 4
 #define mainANALOG_DEADZONE 0x4000
 
-#define TEX_W 256
-#define TEX_H 224
-
 static struct mAVStream stream;
 static struct mRotationSource rotation = {0};
 static int audioBufferActive;
@@ -61,49 +57,36 @@ static int enqueuedBuffers;
 static bool frameLimiter = true;
 static unsigned framecount = 0;
 static unsigned framecap = 10;
-static uint8_t vmode;
 static uint32_t vwidth = 1920;
 static uint32_t vheight = 1080;
-static uint32_t drcwidth = 800;
+static uint32_t drcwidth = 854;
 static uint32_t drcheight = 480;
-static bool interframeBlending = false;
-static bool sgbCrop = false;
-static bool useLightSensor = true;
-static struct mGUIRunnerLux lightSensor;
-
-GX2RBuffer corePositionBuffer = {0};
-GX2RBuffer guiPositionBuffer = {0};
-GX2RBuffer texCoordBuffer = {0};
+bool sgbCrop = false;
+static bool running;
 
 color_t* outputBuffer;
-GX2Texture coreTexture;
-GX2Texture uiTexture;
-GX2Sampler coreSampler;
-GX2Sampler* uiSampler;
-struct WHBGfxShaderGroup textureShaderGroup;
 
-static enum ScreenMode {
-	SM_PA,
-	SM_AF,
-	SM_SF,
-	SM_MAX
-} screenMode = SM_PA;
-
+ScreenMode screenMode = SM_PA;
 
 static void _mapKey(struct mInputMap* map, uint32_t binding, int nativeKey, enum GBAKey key) {
 	mInputBindKey(map, binding, __builtin_ctz(nativeKey), key);
 }
 
 static void _drawStart(void) {
-	if (!WHBProcIsRunning())
+	if (!running)
 		return;
+
 	WHBGfxBeginRender();
 }
 
 static void _drawEnd(void) {
-	if (!WHBProcIsRunning())
+	if (!running)
 		return;
+
+	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_TV);
+	GX2CopyColorBufferToScanBuffer(WHBGfxGetDRCColourBuffer(), GX2_SCAN_TARGET_DRC);
 	WHBGfxFinishRender();
+	WHBLogPrint("drawend");
 }
 
 static uint32_t _pollInput(const struct mInputMap* map) {
@@ -117,88 +100,8 @@ static uint32_t _pollInput(const struct mInputMap* map) {
 static enum GUICursorState _pollCursor(unsigned* x, unsigned* y) {
 }
 
+
 static void _setup(struct mGUIRunner* runner) {
-	// todo put this not here
-	coreTexture.surface.width = TEX_W;
-	coreTexture.surface.height = TEX_H;
-	coreTexture.surface.depth = 4;
-	coreTexture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-	coreTexture.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
-	coreTexture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
-	coreTexture.viewNumSlices = 1;
-	coreTexture.compMap = 0x03020100;
-	GX2CalcSurfaceSizeAndAlignment(&coreTexture.surface);
-	GX2InitTextureRegs(&coreTexture);
-	coreTexture.surface.image = MEMAllocFromDefaultHeapEx(coreTexture.surface.imageSize, coreTexture.surface.alignment);
-
-	FILE* textureShader = fopen("romfs:/texture_shader.gsh", "r");
-
-	if (!textureShader) {
-		WHBLogPrint("failed to load texture shader");
-		return 1;
-	}
-
-	fseek(textureShader, 0, SEEK_END);
-	size_t size = ftell(textureShader);
-	WHBLogPrintf("size = %d", size);
-	fseek(textureShader, 0, SEEK_SET);
-
-	void* shader = malloc(size);
-	fread(shader, size, 1, textureShader);
-	fclose(textureShader);
-
-	if (!WHBGfxLoadGFDShaderGroup(&textureShaderGroup, 0, shader)) {
-		WHBLogPrint("WHBGfxLoadGFDShader returned false");
-		return 1;
-	}
-
-	free(shader);
-
-	WHBGfxInitShaderAttribute(&textureShaderGroup, "position", 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32);
-	WHBGfxInitShaderAttribute(&textureShaderGroup, "tex_coord_in", 1, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32);
-	WHBGfxInitFetchShader(&textureShaderGroup);
-
-	const float texCoords[] = {
-		0.0f, 1.0f,
-		1.0f, 1.0f,
-		1.0f, 0.0f,
-		0.0f, 0.0f,
-	};
-	const float pos[] = {
-		-1.0f, -1.0f,
-		1.0f, -1.0f,
-		1.0f, 1.0f,
-		-1.0f, 1.0f,
-	};
-
-	void* buffer;
-
-	WHBLogPrint("setup coord buffer");
-	texCoordBuffer.flags = GX2R_RESOURCE_BIND_VERTEX_BUFFER |
-		GX2R_RESOURCE_USAGE_CPU_READ |
-		GX2R_RESOURCE_USAGE_CPU_WRITE |
-		GX2R_RESOURCE_USAGE_GPU_READ;
-	texCoordBuffer.elemSize = 2 * 4;
-	texCoordBuffer.elemCount = 4;
-	GX2RCreateBuffer(&texCoordBuffer);
-	buffer = GX2RLockBufferEx(&texCoordBuffer, 0);
-	memcpy(buffer, texCoords, texCoordBuffer.elemSize * texCoordBuffer.elemCount);
-	GX2RUnlockBufferEx(&texCoordBuffer, 0);
-
-	WHBLogPrint("setup pos buffer");
-	corePositionBuffer.flags = GX2R_RESOURCE_BIND_VERTEX_BUFFER |
-		GX2R_RESOURCE_USAGE_CPU_READ |
-		GX2R_RESOURCE_USAGE_CPU_WRITE |
-		GX2R_RESOURCE_USAGE_GPU_READ;
-	corePositionBuffer.elemSize = 2 * 4;
-	corePositionBuffer.elemCount = 8;
-	GX2RCreateBuffer(&corePositionBuffer);
-	buffer = GX2RLockBufferEx(&corePositionBuffer, 0);
-	memcpy(buffer, pos, corePositionBuffer.elemSize * corePositionBuffer.elemCount);
-	GX2RUnlockBufferEx(&corePositionBuffer, 0);
-
-	GX2InitSampler(&coreSampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
-
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_A, GBA_KEY_A);
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_B, GBA_KEY_B);
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_PLUS, GBA_KEY_START);
@@ -210,13 +113,7 @@ static void _setup(struct mGUIRunner* runner) {
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_L, GBA_KEY_L);
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_R, GBA_KEY_R);
 
-//	runner->core->setPeripheral(runner->core, mPERIPH_RUMBLE, &rumble.d);
-//	runner->core->setPeripheral(runner->core, mPERIPH_ROTATION, &rotation);
 //	runner->core->setAVStream(runner->core, &stream);
-
-/*	if (runner->core->platform(runner->core) == PLATFORM_GBA && useLightSensor) {
-		runner->core->setPeripheral(runner->core, mPERIPH_GBA_LUMINANCE, &lightSensor.d);
-	}*/
 
 	unsigned mode;
 	if (mCoreConfigGetUIntValue(&runner->config, "screenMode", &mode) && mode < SM_MAX) {
@@ -230,7 +127,6 @@ static void _setup(struct mGUIRunner* runner) {
 }
 
 static void _teardown(struct mGUIRunner* runner) {
-	WHBProcStopRunning();
 	WHBLogPrint("_teardown called");
 }
 
@@ -249,126 +145,21 @@ static void _gameLoaded(struct mGUIRunner* runner) {
 	}
 
 	int fakeBool;
-	if (mCoreConfigGetIntValue(&runner->config, "interframeBlending", &fakeBool)) {
-		interframeBlending = fakeBool;
-	}
 	if (mCoreConfigGetIntValue(&runner->config, "sgb.borderCrop", &fakeBool)) {
 		sgbCrop = fakeBool;
 	}
-/*	if (mCoreConfigGetIntValue(&runner->config, "useLightSensor", &fakeBool)) {
-		if (useLightSensor != fakeBool) {
-			useLightSensor = fakeBool;
-
-			if (runner->core->platform(runner->core) == PLATFORM_GBA) {
-				if (useLightSensor) {
-					runner->core->setPeripheral(runner->core, mPERIPH_GBA_LUMINANCE, &lightSensor.d);
-				} else {
-					runner->core->setPeripheral(runner->core, mPERIPH_GBA_LUMINANCE, &runner->luminanceSource.d);
-				}
-			}
-		}
-	}*/
 
 	int scale;
 	if (mCoreConfigGetUIntValue(&runner->config, "videoScale", &scale)) {
 		runner->core->reloadConfigOption(runner->core, "videoScale", &runner->config);
 	}
-
 }
 
 static void _gameUnloaded(struct mGUIRunner* runner) {
 }
 
-static void _drawTex(struct mGUIRunner* runner, unsigned width, unsigned height, bool faded, bool blendTop, bool drc) {
-	float inwidth = width;
-	float inheight = height;
-	float screenWidth = vwidth;
-	float screenHeight = vheight;
-
-	if (drc) {
-		screenWidth = drcwidth;
-		screenHeight = drcheight;
-	}
-
-	if (sgbCrop && width == 256 && height == 224) {
-		inwidth = GB_VIDEO_HORIZONTAL_PIXELS;
-		inheight = GB_VIDEO_VERTICAL_PIXELS;
-	}
-	float aspectX = inwidth / screenWidth;
-	float aspectY = inheight / screenHeight;
-	float max = 1.f;
-
-	switch (screenMode) {
-	case SM_PA:
-		if (aspectX > aspectY) {
-			max = floor(1.0 / aspectX);
-		} else {
-			max = floor(1.0 / aspectY);
-		}
-		if (max >= 1.0 && !drc) {
-			break;
-		}
-		// Fall through
-	case SM_AF:
-		if (aspectX > aspectY) {
-			max = 1.0 / aspectX;
-		} else {
-			max = 1.0 / aspectY;
-		}
-		break;
-	case SM_SF:
-		aspectX = 1.0;
-		aspectY = 1.0;
-		break;
-	}
-
-	if (screenMode != SM_SF) {
-		aspectX = width / (float) screenWidth;
-		aspectY = height / (float) screenHeight;
-	}
-
-	aspectX *= max;
-	aspectY *= max;
-
-	float wpart = (1.0f / TEX_W) * (float) width;
-	float hpart = (1.0f / TEX_H) * (float) height;
-
-	const float texCoords[] = {
-		0.0f, hpart,
-		wpart, hpart,
-		wpart, 0.0f,
-		0.0f, 0.0f,
-	};
-	const float pos[] = {
-		-aspectX, -aspectY,
-		aspectX, -aspectY,
-		aspectX, aspectY,
-		-aspectX, aspectY,
-	};
-
-	void* buffer;
-
-	buffer = GX2RLockBufferEx(&texCoordBuffer, 0);
-	memcpy(buffer, texCoords, texCoordBuffer.elemSize * texCoordBuffer.elemCount);
-	GX2RUnlockBufferEx(&texCoordBuffer, 0);
-
-	GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, &texCoordBuffer, texCoordBuffer.elemCount * texCoordBuffer.elemSize);
-
-	buffer = GX2RLockBufferEx(&corePositionBuffer, 0);
-	memcpy(buffer + (drc ? corePositionBuffer.elemSize * 4 : 0), pos, corePositionBuffer.elemSize * 4);
-	GX2RUnlockBufferEx(&corePositionBuffer, 0);
-
-	GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, &corePositionBuffer, corePositionBuffer.elemCount * corePositionBuffer.elemSize);
-
-	GX2RSetAttributeBuffer(&corePositionBuffer, 0, corePositionBuffer.elemSize, drc ? corePositionBuffer.elemSize * 4 : 0);
-	GX2RSetAttributeBuffer(&texCoordBuffer, 1, texCoordBuffer.elemSize, 0);
-	GX2SetPixelTexture(&coreTexture, 0);
-	GX2SetPixelSampler(&coreSampler, 0);
-	GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
-}
-
 static void _prepareForFrame(struct mGUIRunner* runner) {
-	if (!WHBProcIsRunning())
+	if (!running)
 		return;
 
 	uint32_t* dst = coreTexture.surface.image;
@@ -384,7 +175,7 @@ static void _prepareForFrame(struct mGUIRunner* runner) {
 }
 
 static void _drawFrame(struct mGUIRunner* runner, bool faded) {
-	if (!WHBProcIsRunning())
+	if (!running)
 		return;
 
 	++framecount;
@@ -395,30 +186,31 @@ static void _drawFrame(struct mGUIRunner* runner, bool faded) {
 	unsigned width, height;
 	runner->core->desiredVideoDimensions(runner->core, &width, &height);
 
-	WHBGfxBeginRenderTV();
-	WHBGfxClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-
+	GX2SetContextState(WHBGfxGetTVContextState());
 	GX2SetFetchShader(&textureShaderGroup.fetchShader);
 	GX2SetVertexShader(textureShaderGroup.vertexShader);
 	GX2SetPixelShader(textureShaderGroup.pixelShader);
+	drawTex(runner, width, height, faded, false, false);
 
-	_drawTex(runner, width, height, faded, false, false);
-	WHBGfxFinishRenderTV();
-
-	WHBGfxBeginRenderDRC();
-	WHBGfxClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	GX2SetContextState(WHBGfxGetDRCContextState());
 	GX2SetFetchShader(&textureShaderGroup.fetchShader);
 	GX2SetVertexShader(textureShaderGroup.vertexShader);
 	GX2SetPixelShader(textureShaderGroup.pixelShader);
-	_drawTex(runner, width, height, faded, false, true);
-	WHBGfxFinishRenderDRC();
+	drawTex(runner, width, height, faded, false, true);
 }
 
 static void _drawScreenshot(struct mGUIRunner* runner, const color_t* pixels, unsigned width, unsigned height, bool faded) {
-	if (!WHBProcIsRunning())
+	if (!running)
 		return;
 
-//	_drawTex(runner, width, height, faded, false);
+	WHBGfxBeginRenderTV();
+	drawTex(runner, width, height, faded, false, false);
+	WHBGfxClearColor(0.0, 0.0, 0.0, 0.0);
+	WHBGfxFinishRenderTV();
+	WHBGfxBeginRenderDRC();
+	drawTex(runner, width, height, faded, false, true);
+	WHBGfxClearColor(0.0, 0.0, 0.0, 0.0);
+	WHBGfxFinishRenderDRC();
 }
 
 static uint16_t _pollGameInput(struct mGUIRunner* runner) {
@@ -437,7 +229,21 @@ static void _setFrameLimiter(struct mGUIRunner* runner, bool limit) {
 
 static bool _running(struct mGUIRunner* runner) {
 	UNUSED(runner);
-	return WHBProcIsRunning();
+	ProcUIStatus status = ProcUIProcessMessages(true);
+
+	switch (status) {
+		case PROCUI_STATUS_RELEASE_FOREGROUND:
+		    ProcUIDrawDoneRelease();
+		    break;
+	    case PROCUI_STATUS_EXITING:
+		    running = false;
+		    return false;
+	    case PROCUI_STATUS_IN_FOREGROUND:
+	    case PROCUI_STATUS_IN_BACKGROUND:
+		    break;
+	}
+
+	return true;
 }
 
 static void _postAudioBuffer(struct mAVStream* stream, blip_t* left, blip_t* right) {
@@ -463,32 +269,6 @@ static void _postAudioBuffer(struct mAVStream* stream, blip_t* left, blip_t* rig
 	++enqueuedBuffers;
 }
 
-void _setRumble(struct mRumble* rumble, int enable) {
-}
-
-int32_t _readTiltX(struct mRotationSource* source) {
-	return 0;
-}
-
-int32_t _readTiltY(struct mRotationSource* source) {
-	return 0;
-}
-
-int32_t _readGyroZ(struct mRotationSource* source) {
-	return 0;
-}
-
-static void _lightSensorSample(struct GBALuminanceSource* lux) {
-	struct mGUIRunnerLux* runnerLux = (struct mGUIRunnerLux*) lux;
-	float luxLevel = 0;
-	runnerLux->luxLevel = cbrtf(luxLevel) * 8;
-}
-
-static uint8_t _lightSensorRead(struct GBALuminanceSource* lux) {
-	struct mGUIRunnerLux* runnerLux = (struct mGUIRunnerLux*) lux;
-	return 0xFF - runnerLux->luxLevel;
-}
-
 static int _batteryState(void) {
 	return 0xFF;
 }
@@ -496,13 +276,24 @@ static int _batteryState(void) {
 static void _guiPrepare(void) {
 }
 
-int main(int argc, char* argv[]) {
-	WHBProcInit();
+static void _guiFinish(void) {
+	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_TV);
+	GX2CopyColorBufferToScanBuffer(WHBGfxGetDRCColourBuffer(), GX2_SCAN_TARGET_DRC);
+	WHBGfxFinishRender();
+}
 
-	WHBLogUdpInit();
-	WHBGfxInit();
+void save_callback() {
+	OSSavesDone_ReadyToRelease();
+}
+
+int main(int argc, char* argv[]) {
+	ProcUIInit(save_callback);
+
+	WHBLogCafeInit();
+//	WHBLogUdpInit();
 	VPADInit();
 	romfsInit();
+	WHBInitCrashHandler();
 
 	char* mountPath = NULL;
 
@@ -517,13 +308,11 @@ int main(int argc, char* argv[]) {
 		mountPath = "/";
 	}
 
-	struct GUIFont* font = GUIFontCreate();
-	rotation.readTiltX = _readTiltX;
-	rotation.readTiltY = _readTiltY;
-	rotation.readGyroZ = _readGyroZ;
+	WHBLogPrint("setupGpu");
+	setupGpu();
 
-	lightSensor.d.readLuminance = _lightSensorRead;
-	lightSensor.d.sample = _lightSensorSample;
+	WHBLogPrint("GUIFontCreate");
+	struct GUIFont* font = GUIFontCreate();
 
 	stream.videoDimensionsChanged = NULL;
 	stream.postVideoFrame = NULL;
@@ -533,26 +322,15 @@ int main(int argc, char* argv[]) {
 	memset(audioBuffer, 0, sizeof(audioBuffer));
 	audioBufferActive = 0;
 	enqueuedBuffers = 0;
-	size_t i;
-	for (i = 0; i < N_BUFFERS; ++i) {
-/*		audoutBuffer[i].next = NULL;
-		audoutBuffer[i].buffer = audioBuffer[i];
-		audoutBuffer[i].buffer_size = BUFFER_SIZE;
-		audoutBuffer[i].data_size = SAMPLES * 4;
-		audoutBuffer[i].data_offset = 0;*/
-	}
-
-
-	bool illuminanceAvailable = false;
 
 	struct mGUIRunner runner = {
 		.params = {
-			800, 480,
+			drcwidth, drcheight,
 			font, mountPath,
 			_drawStart, _drawEnd,
 			_pollInput, _pollCursor,
 			_batteryState,
-			_guiPrepare, NULL,
+			_guiPrepare, _guiFinish,
 		},
 		.keySources = (struct GUIInputKeys[]) {
 			{
@@ -631,19 +409,8 @@ int main(int argc, char* argv[]) {
 				},
 				.nStates = 16
 			},
-			{
-				.title = "Use built-in brightness sensor for Boktai",
-				.data = "useLightSensor",
-				.submenu = 0,
-				.state = illuminanceAvailable,
-				.validStates = (const char*[]) {
-					"Off",
-					"On",
-				},
-				.nStates = 2
-			},
 		},
-		.nConfigExtra = 3,
+		.nConfigExtra = 2,
 		.setup = _setup,
 		.teardown = _teardown,
 		.gameLoaded = _gameLoaded,
@@ -668,6 +435,7 @@ int main(int argc, char* argv[]) {
 	_mapKey(&runner.params.keyMap, VPAD_INPUT, VPAD_BUTTON_LEFT, GUI_INPUT_LEFT);
 	_mapKey(&runner.params.keyMap, VPAD_INPUT, VPAD_BUTTON_RIGHT, GUI_INPUT_RIGHT);
 
+	WHBLogPrint("starting runner");
 	if (argc > 1) {
 		size_t i;
 		for (i = 0; runner.keySources[i].id; ++i) {
@@ -690,9 +458,8 @@ int main(int argc, char* argv[]) {
 
 	VPADShutdown();
 	WHBGfxShutdown();
+	WHBLogCafeDeinit();
 	WHBLogUdpDeinit();
-
-	WHBProcShutdown();
 
 	return 0;
 }
