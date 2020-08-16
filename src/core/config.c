@@ -27,6 +27,10 @@
 #include <mgba-util/platform/3ds/3ds-vfs.h>
 #endif
 
+#ifdef __WIIU__
+#include <whb/sdcard.h>
+#endif
+
 #ifdef __HAIKU__
 #include <FindDirectory.h>
 #endif
@@ -147,11 +151,13 @@ void mCoreConfigDeinit(struct mCoreConfig* config) {
 	free(config->port);
 }
 
+#include <whb/log.h>
 #if !defined(MINIMAL_CORE) || MINIMAL_CORE < 2
 bool mCoreConfigLoad(struct mCoreConfig* config) {
 	char path[PATH_MAX];
 	mCoreConfigDirectory(path, PATH_MAX);
 	strncat(path, PATH_SEP "config.ini", PATH_MAX - strlen(path));
+	WHBLogPrintf("config path %s", path);
 	return mCoreConfigLoadPath(config, path);
 }
 
@@ -231,6 +237,10 @@ void mCoreConfigDirectory(char* out, size_t outLength) {
 	UNUSED(portable);
 	snprintf(out, outLength, "/%s", projectName);
 	FSUSER_CreateDirectory(sdmcArchive, fsMakePath(PATH_ASCII, out), 0);
+#elif defined(__WIIU__)
+	UNUSED(portable);
+	snprintf(out, outLength, "%s/%s", WHBGetSdCardMountPath(), projectName);
+	mkdir(out, 0777);
 #elif defined(__HAIKU__)
 	getcwd(out, outLength);
 	strncat(out, PATH_SEP "portable.ini", outLength - strlen(out));

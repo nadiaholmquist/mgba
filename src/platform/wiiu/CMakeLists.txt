@@ -20,7 +20,8 @@ target_link_libraries(${BINARY_NAME}-wiiu
     ${BINARY_NAME} ${M_LIBRARY} coreinit gx2 vpad vpadbase gfd whb proc_ui sysapp ${OS_LIB}
 )
 configure_file("${CMAKE_SOURCE_DIR}/res/font-new.png" romfs/font-new.png COPYONLY)
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/texture_shader.gsh" romfs/texture_shader.gsh COPYONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/shaders/main.gsh" romfs/main.gsh COPYONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/shaders/font.gsh" romfs/font.gsh COPYONLY)
 
 #add_custom_command(OUTPUT romfs.bin
 #                   COMMAND ${CMAKE_COMMAND} -E make_directory romfs

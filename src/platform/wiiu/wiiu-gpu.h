@@ -2,24 +2,14 @@
 // Created by nhp on 14/08/2020.
 //
 
+#include <whb/gfx.h>
 #ifndef MGBA_WIIU_GPU_H
 #define MGBA_WIIU_GPU_H
 
-#include <feature/gui/gui-runner.h>
-#define TEX_W 256
-#define TEX_H 224
-
-extern GX2Texture coreTexture;
-extern struct WHBGfxShaderGroup textureShaderGroup;
-
-typedef enum ScreenMode {
-	SM_PA,
-	SM_AF,
-	SM_SF,
-	SM_MAX
-} ScreenMode;
-
-void setupGpu();
-void drawTex(struct mGUIRunner* runner, unsigned width, unsigned height, bool faded, bool blendTop, bool drc);
+void gpuInitTexture(GX2Texture* texture, uint32_t width, uint32_t height, GX2SurfaceFormat format);
+void gpuInitBuffer(GX2RBuffer* buffer, uint32_t elemSize, uint32_t elemCount);
+void gpuSetShaders(const WHBGfxShaderGroup* group);
+void gpuUpdateTexture(GX2Texture* texture, const void* data, size_t pixelSize);
+bool gpuInitShaderGroup(WHBGfxShaderGroup* group, const char* path);
 
 #endif // MGBA_WIIU_GPU_H

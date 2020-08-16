@@ -32,15 +32,17 @@
 #include <whb/log_cafe.h>
 #include <whb/crash.h>
 
-#include "wiiu-gpu.h"
-
 #include <romfs-wiiu.h>
 
+#include <gx2/display.h>
+#include <gx2/draw.h>
 #include <gx2/mem.h>
 #include <gx2/surface.h>
 #include <gx2/swap.h>
-#include <gx2/display.h>
+#include <gx2r/draw.h>
 #include <vpad/input.h>
+
+#include "wiiu-gpu.h"
 
 #define VPAD_INPUT 0x7f87ffff
 
@@ -62,11 +64,35 @@ static uint32_t vheight = 1080;
 static uint32_t drcwidth = 854;
 static uint32_t drcheight = 480;
 bool sgbCrop = false;
-static bool running;
+static bool running = true;
+
+extern bool sgbCrop;
+GX2Texture coreTexture = {0};
+GX2RBuffer offsetBuffer = {0};
+GX2UniformVar* dimsUniform;
+GX2UniformVar* insizeUniform;
+GX2UniformVar* colorUniform;
+GX2Sampler coreSampler;
+WHBGfxShaderGroup shaderGroup;
+
+#define TEX_W 256
+#define TEX_H 224
 
 color_t* outputBuffer;
 
-ScreenMode screenMode = SM_PA;
+static const float _offsets[] = {
+	0.f, 0.f,
+	1.f, 0.f,
+	1.f, 1.f,
+	0.f, 1.f,
+};
+
+enum ScreenMode {
+	SM_PA,
+	SM_AF,
+	SM_SF,
+	SM_MAX
+} screenMode = SM_PA;
 
 static void _mapKey(struct mInputMap* map, uint32_t binding, int nativeKey, enum GBAKey key) {
 	mInputBindKey(map, binding, __builtin_ctz(nativeKey), key);
@@ -75,18 +101,21 @@ static void _mapKey(struct mInputMap* map, uint32_t binding, int nativeKey, enum
 static void _drawStart(void) {
 	if (!running)
 		return;
+	WHBLogPrint("drawstart");
 
-	WHBGfxBeginRender();
+	WHBGfxBeginRenderTV();
+	WHBGfxClearColor(1.0, 0.0, 0.0, 0.0);
+	WHBGfxBeginRenderDRC();
+	WHBGfxClearColor(0.0, 0.0, 0.0, 0.0);
 }
 
 static void _drawEnd(void) {
 	if (!running)
 		return;
 
-	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_TV);
-	GX2CopyColorBufferToScanBuffer(WHBGfxGetDRCColourBuffer(), GX2_SCAN_TARGET_DRC);
+	WHBGfxFinishRenderTV();
+	WHBGfxFinishRenderDRC();
 	WHBGfxFinishRender();
-	WHBLogPrint("drawend");
 }
 
 static uint32_t _pollInput(const struct mInputMap* map) {
@@ -100,6 +129,21 @@ static uint32_t _pollInput(const struct mInputMap* map) {
 static enum GUICursorState _pollCursor(unsigned* x, unsigned* y) {
 }
 
+
+static void _initGpu() {
+	WHBGfxInit();
+	gpuInitShaderGroup(&shaderGroup, "romfs:/main.gsh");
+
+	WHBGfxInitShaderAttribute(&shaderGroup, "offset", 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32);
+	WHBGfxInitFetchShader(&shaderGroup);
+	dimsUniform = GX2GetVertexUniformVar(shaderGroup.vertexShader, "dims");
+	insizeUniform = GX2GetVertexUniformVar(shaderGroup.vertexShader, "insize");
+	colorUniform = GX2GetPixelUniformVar(shaderGroup.pixelShader, "color");
+
+	gpuInitBuffer(&offsetBuffer, 2 * sizeof(float), 4);
+	gpuInitTexture(&coreTexture, TEX_W, TEX_H, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8);
+	GX2InitSampler(&coreSampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
+}
 
 static void _setup(struct mGUIRunner* runner) {
 	_mapKey(&runner->core->inputMap, VPAD_INPUT, VPAD_BUTTON_A, GBA_KEY_A);
@@ -161,22 +205,91 @@ static void _gameUnloaded(struct mGUIRunner* runner) {
 static void _prepareForFrame(struct mGUIRunner* runner) {
 	if (!running)
 		return;
+	WHBLogPrint("prepareForFrame");
 
-	uint32_t* dst = coreTexture.surface.image;
-	uint32_t* src = outputBuffer;
+	gpuUpdateTexture(&coreTexture, outputBuffer, sizeof(uint32_t));
+}
 
-	for (uint32_t i = 0; i < TEX_H; i++) {
-		memcpy(dst, src, TEX_W * sizeof(uint32_t));
-		dst += coreTexture.surface.pitch;
-		src += TEX_W;
+void _drawTex(struct mGUIRunner* runner, unsigned width, unsigned height, bool faded, bool blendTop, bool drc) {
+	float inwidth = width;
+	float inheight = height;
+	float screenWidth = vwidth;
+	float screenHeight = vheight;
+
+	if (drc) {
+		screenWidth = drcwidth;
+		screenHeight = drcheight; }
+
+	if (sgbCrop && width == 256 && height == 224) {
+		inwidth = GB_VIDEO_HORIZONTAL_PIXELS;
+		inheight = GB_VIDEO_VERTICAL_PIXELS;
+	}
+	float aspectX = inwidth / screenWidth;
+	float aspectY = inheight / screenHeight;
+	float max = 1.f;
+
+	switch (screenMode) {
+	case SM_PA:
+		if (aspectX > aspectY) {
+			max = floor(1.0 / aspectX);
+		} else {
+			max = floor(1.0 / aspectY);
+		}
+		if (max >= 1.0 && !drc) {
+			break;
+		}
+		// Fall through
+	case SM_AF:
+		if (aspectX > aspectY) {
+			max = 1.0 / aspectX;
+		} else {
+			max = 1.0 / aspectY;
+		}
+		break;
+	case SM_SF:
+		aspectX = 1.0;
+		aspectY = 1.0;
+		break;
 	}
 
-	GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, coreTexture.surface.image, coreTexture.surface.imageSize);
+	if (screenMode != SM_SF) {
+		aspectX = width / (float) screenWidth;
+		aspectY = height / (float) screenHeight;
+	}
+
+	aspectX *= max;
+	aspectY *= max;
+
+	uint32_t cwidth, cheight;
+	runner->core->desiredVideoDimensions(runner->core, &cwidth, &cheight);
+
+	float insize[] = { 1.0 / TEX_W * cwidth, 1.0 / TEX_H * cheight };
+	float dims[] = { aspectX, aspectY };
+	float color[] = {1.0f, 1.0f, 1.0f, 1.0f};
+	float fadedColor[] = {0.5f, 0.5f, 0.5f, 1.0f};
+
+	void* buffer = GX2RLockBufferEx(&offsetBuffer, 0);
+	memcpy(buffer, _offsets, offsetBuffer.elemSize * 4);
+	GX2RUnlockBufferEx(&offsetBuffer, 0);
+
+	gpuSetShaders(&shaderGroup);
+	GX2RSetAttributeBuffer(&offsetBuffer, 0, offsetBuffer.elemSize, 0);
+	GX2SetVertexUniformReg(dimsUniform->offset, 2, &dims);
+	GX2SetVertexUniformReg(insizeUniform->offset, 2, &insize);
+	if (faded) {
+		GX2SetPixelUniformReg(colorUniform->offset, 4, &fadedColor);
+	} else {
+		GX2SetPixelUniformReg(colorUniform->offset, 4, &color);
+	}
+	GX2SetPixelTexture(&coreTexture, 0);
+	GX2SetPixelSampler(&coreSampler, 0);
+	GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
 }
 
 static void _drawFrame(struct mGUIRunner* runner, bool faded) {
 	if (!running)
 		return;
+	WHBLogPrint("drawFrame");
 
 	++framecount;
 	if (!frameLimiter && framecount < framecap) {
@@ -186,31 +299,22 @@ static void _drawFrame(struct mGUIRunner* runner, bool faded) {
 	unsigned width, height;
 	runner->core->desiredVideoDimensions(runner->core, &width, &height);
 
-	GX2SetContextState(WHBGfxGetTVContextState());
-	GX2SetFetchShader(&textureShaderGroup.fetchShader);
-	GX2SetVertexShader(textureShaderGroup.vertexShader);
-	GX2SetPixelShader(textureShaderGroup.pixelShader);
-	drawTex(runner, width, height, faded, false, false);
+	WHBGfxBeginRenderTV();
+	_drawTex(runner, width, height, faded, false, false);
 
-	GX2SetContextState(WHBGfxGetDRCContextState());
-	GX2SetFetchShader(&textureShaderGroup.fetchShader);
-	GX2SetVertexShader(textureShaderGroup.vertexShader);
-	GX2SetPixelShader(textureShaderGroup.pixelShader);
-	drawTex(runner, width, height, faded, false, true);
+	WHBGfxBeginRenderDRC();
+	_drawTex(runner, width, height, faded, false, true);
 }
 
 static void _drawScreenshot(struct mGUIRunner* runner, const color_t* pixels, unsigned width, unsigned height, bool faded) {
+	WHBLogPrint("drawScreenshot");
 	if (!running)
 		return;
 
 	WHBGfxBeginRenderTV();
-	drawTex(runner, width, height, faded, false, false);
-	WHBGfxClearColor(0.0, 0.0, 0.0, 0.0);
+	_drawTex(runner, width, height, faded, false, false);
 	WHBGfxFinishRenderTV();
-	WHBGfxBeginRenderDRC();
-	drawTex(runner, width, height, faded, false, true);
-	WHBGfxClearColor(0.0, 0.0, 0.0, 0.0);
-	WHBGfxFinishRenderDRC();
+	_drawTex(runner, width, height, faded, false, true);
 }
 
 static uint16_t _pollGameInput(struct mGUIRunner* runner) {
@@ -237,6 +341,7 @@ static bool _running(struct mGUIRunner* runner) {
 		    break;
 	    case PROCUI_STATUS_EXITING:
 		    running = false;
+		    ProcUIShutdown();
 		    return false;
 	    case PROCUI_STATUS_IN_FOREGROUND:
 	    case PROCUI_STATUS_IN_BACKGROUND:
@@ -274,12 +379,16 @@ static int _batteryState(void) {
 }
 
 static void _guiPrepare(void) {
+	WHBLogPrint("guiPrepare");
+	WHBGfxBeginRender();
 }
 
 static void _guiFinish(void) {
-	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_TV);
-	GX2CopyColorBufferToScanBuffer(WHBGfxGetDRCColourBuffer(), GX2_SCAN_TARGET_DRC);
-	WHBGfxFinishRender();
+	WHBLogPrint("guifinish");
+
+/*	WHBGfxFinishRenderTV();
+	WHBGfxFinishRenderDRC();
+	WHBGfxFinishRender();*/
 }
 
 void save_callback() {
@@ -308,10 +417,9 @@ int main(int argc, char* argv[]) {
 		mountPath = "/";
 	}
 
-	WHBLogPrint("setupGpu");
-	setupGpu();
+	_initGpu();
+	WHBLogPrint("Init GPU");
 
-	WHBLogPrint("GUIFontCreate");
 	struct GUIFont* font = GUIFontCreate();
 
 	stream.videoDimensionsChanged = NULL;
@@ -325,7 +433,7 @@ int main(int argc, char* argv[]) {
 
 	struct mGUIRunner runner = {
 		.params = {
-			drcwidth, drcheight,
+			1280, 720,
 			font, mountPath,
 			_drawStart, _drawEnd,
 			_pollInput, _pollCursor,
